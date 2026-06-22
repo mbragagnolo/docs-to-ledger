@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Any
 
 import pdfplumber
 
@@ -30,12 +31,12 @@ _DESC_X_MAX = 250.0
 _AMOUNT_X_MIN = 400.0
 
 
-def _group_words_by_line(words: list[dict]) -> list[list[dict]]:
+def _group_words_by_line(words: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
     if not words:
         return []
     sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
-    lines: list[list[dict]] = []
-    current: list[dict] = [sorted_words[0]]
+    lines: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = [sorted_words[0]]
     current_y: float = sorted_words[0]["top"]
     for word in sorted_words[1:]:
         if abs(word["top"] - current_y) <= _LINE_Y_TOLERANCE:
@@ -55,7 +56,7 @@ def _ascii_alpha(text: str) -> str:
     return "".join(c for c in nfkd if c.isascii() and c.isalpha())
 
 
-def _find_debit_credit_boundary(words: list[dict]) -> float | None:
+def _find_debit_credit_boundary(words: list[dict[str, Any]]) -> float | None:
     """Return x midpoint between the Débit and Crédit column headers."""
     debit_x1: float | None = None
     credit_x0: float | None = None
@@ -70,7 +71,7 @@ def _find_debit_credit_boundary(words: list[dict]) -> float | None:
     return None
 
 
-def _find_amount(line_words: list[dict]) -> tuple[int, bool] | tuple[None, None]:
+def _find_amount(line_words: list[dict[str, Any]]) -> tuple[int, bool] | tuple[None, None]:
     """Return (word_index, is_amount_like) for the rightmost amount in a line.
 
     Only words at x0 > _AMOUNT_X_MIN are considered to avoid false matches on
@@ -84,7 +85,7 @@ def _find_amount(line_words: list[dict]) -> tuple[int, bool] | tuple[None, None]
 
 
 def _flush(
-    pending: dict,
+    pending: dict[str, Any],
     source: SourceRule,
     counter: dict[str, int],
     file_str: str,
@@ -158,7 +159,7 @@ def parse_pdf_sg(file_path: Path, source: SourceRule) -> ParseResult:
             if boundary is None:
                 continue
 
-            pending: dict | None = None
+            pending: dict[str, Any] | None = None
 
             for line_words in _group_words_by_line(words):
                 global_line += 1

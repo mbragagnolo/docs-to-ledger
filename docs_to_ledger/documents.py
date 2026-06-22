@@ -177,6 +177,8 @@ def _features_from_text(source_path: str, text: str, needs_ocr: bool) -> Documen
     """Build a DocumentFeature from *text*; fall back to sentinel values when nothing found."""
     # Prefer the 'prélevé le' line: gives exact bank debit date and amount.
     prelevment = _extract_prelevment_features(text)
+    amount: Decimal | None
+    date: datetime.date | None
     if prelevment is not None:
         date, amount = prelevment
     else:

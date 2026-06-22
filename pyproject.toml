@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "docs-to-ledger"
-version = "0.1.0"
+version = "1.0.0"
 description = "Build per-account ledger workbooks from bank statements and matched documents"
 requires-python = ">=3.10"
 dependencies = [

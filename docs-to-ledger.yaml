@@ -1,0 +1,30 @@
+sources:
+  - account: "SG Compte Courant"
+    statement_type: csv
+    path_pattern: "**/*.csv"
+    locale:
+      date_format: "dd/mm/yyyy"
+      decimal_separator: comma
+      thousands_separator: space
+    column_map:
+      date: "Date de l'operation"
+      description: "Libelle"
+      debit: "Debit"
+      credit: "Credit"
+
+  - account: "SG Compte Courant"
+    statement_type: pdf
+    path_pattern: "Documents_*.pdf"
+    locale:
+      date_format: "dd/mm/yyyy"
+      decimal_separator: comma
+      thousands_separator: dot
+
+matching:
+  date_window_days: 3
+  amount_tolerance: 0
+  fuzzy_vendor: true
+
+archive:
+  root: "archive"
+  layout: "year/month"
