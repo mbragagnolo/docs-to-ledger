@@ -1,19 +1,17 @@
-"""SG (Société Générale) PDF statement parser using pdfplumber.
+"""SG (Société Générale) PDF statement parser using pdfplumber word extraction.
 
-PROVISIONAL: Built against a documented assumed SG layout.
-A real SG PDF sample is needed to verify this profile.
+Each page has transaction rows where each row starts with an operation date
+(DD/MM/YYYY at ~x=31) followed by a value date, description words, and a
+single amount that lands in either the Débit or Crédit column.  Multi-line
+descriptions follow at x≈124 until the next transaction or page boundary.
 
-Expected SG PDF layout (assumption):
-- Table rows with columns: Date, Description, Debit, Credit
-- Same French locale as CSV (dd/mm/yyyy, comma decimal)
-- Uses pdfplumber's extract_table() on each page
-- Same failure semantics as CSV parser
+Column boundaries are derived from the Débit/Crédit header words found on
+each page, so the parser adapts if the layout shifts across pages.
 """
 from __future__ import annotations
 
-from decimal import Decimal
+import re
 from pathlib import Path
-from typing import Any
 
 import pdfplumber
 
@@ -23,149 +21,187 @@ from docs_to_ledger.parsing.locale import parse_amount, parse_date
 
 from . import ParseFailure, ParseResult
 
-# Assumed column names in the SG PDF table.  The parser falls back to positional
-# matching when the header row cannot be identified.
-_SG_EXPECTED_HEADERS = ("date", "description", "debit", "credit")
+_DATE_RE = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+_AMOUNT_RE = re.compile(r"^\d[\d.]*,\d{2}\*?$")
+
+_LINE_Y_TOLERANCE = 3.0
+_DESC_X_MIN = 80.0
+_DESC_X_MAX = 250.0
+_AMOUNT_X_MIN = 400.0
 
 
-def _cell_value(row: list[Any], idx: int | None) -> str:
-    """Extract a stripped string cell from *row* at *idx*, returning '' for None/missing."""
-    if idx is None or idx >= len(row):
-        return ""
-    return str(row[idx] or "").strip()
+def _group_words_by_line(words: list[dict]) -> list[list[dict]]:
+    if not words:
+        return []
+    sorted_words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+    lines: list[list[dict]] = []
+    current: list[dict] = [sorted_words[0]]
+    current_y: float = sorted_words[0]["top"]
+    for word in sorted_words[1:]:
+        if abs(word["top"] - current_y) <= _LINE_Y_TOLERANCE:
+            current.append(word)
+        else:
+            lines.append(sorted(current, key=lambda w: w["x0"]))
+            current = [word]
+            current_y = word["top"]
+    lines.append(sorted(current, key=lambda w: w["x0"]))
+    return lines
 
 
-def _find_col(headers: list[str], name: str) -> int | None:
-    """Return position of *name* in *headers*, or None if absent."""
+def _ascii_alpha(text: str) -> str:
+    """Lowercase, strip accents, keep only ASCII a-z."""
+    import unicodedata
+    nfkd = unicodedata.normalize("NFKD", text.lower())
+    return "".join(c for c in nfkd if c.isascii() and c.isalpha())
+
+
+def _find_debit_credit_boundary(words: list[dict]) -> float | None:
+    """Return x midpoint between the Débit and Crédit column headers."""
+    debit_x1: float | None = None
+    credit_x0: float | None = None
+    for w in words:
+        a = _ascii_alpha(w["text"])
+        if a == "debit" and debit_x1 is None:
+            debit_x1 = w["x1"]
+        elif a == "credit" and credit_x0 is None:
+            credit_x0 = w["x0"]
+    if debit_x1 is not None and credit_x0 is not None:
+        return (debit_x1 + credit_x0) / 2.0
+    return None
+
+
+def _find_amount(line_words: list[dict]) -> tuple[int, bool] | tuple[None, None]:
+    """Return (word_index, is_amount_like) for the rightmost amount in a line.
+
+    Only words at x0 > _AMOUNT_X_MIN are considered to avoid false matches on
+    reference numbers inside descriptions.
+    """
+    for i in range(len(line_words) - 1, -1, -1):
+        w = line_words[i]
+        if w["x0"] >= _AMOUNT_X_MIN and _AMOUNT_RE.match(w["text"]):
+            return i, True
+    return None, None
+
+
+def _flush(
+    pending: dict,
+    source: SourceRule,
+    counter: dict[str, int],
+    file_str: str,
+    failures: list[ParseFailure],
+) -> Transaction | None:
     try:
-        return headers.index(name)
-    except ValueError:
+        txn_date = parse_date(pending["date_str"], source.locale)
+    except ValueError as exc:
+        failures.append(
+            ParseFailure(file=file_str, line=pending["line"], reason=str(exc))
+        )
         return None
+
+    raw_amount = pending["amount_str"]
+    if raw_amount is None:
+        failures.append(
+            ParseFailure(
+                file=file_str,
+                line=pending["line"],
+                reason="No amount found for transaction",
+            )
+        )
+        return None
+
+    raw_amount = raw_amount.rstrip("*")
+    try:
+        amount = abs(parse_amount(raw_amount, source.locale))
+    except ValueError as exc:
+        failures.append(
+            ParseFailure(file=file_str, line=pending["line"], reason=str(exc))
+        )
+        return None
+
+    is_debit: bool = pending["is_debit"]
+    debit = amount if is_debit else None
+    credit = None if is_debit else amount
+
+    description = " ".join(pending["desc_parts"])
+    normalized = fingerprint.normalize_description(description)
+    txn_id = fingerprint.transaction_id(source.account, txn_date, amount, normalized)
+    occ = counter.get(txn_id, 0)
+    counter[txn_id] = occ + 1
+
+    return Transaction(
+        date=txn_date,
+        description=description,
+        debit=debit,
+        credit=credit,
+        account=source.account,
+        source_file=file_str,
+        txn_id=txn_id,
+        occurrence=occ,
+    )
 
 
 def parse_pdf_sg(file_path: Path, source: SourceRule) -> ParseResult:
-    """Parse an SG-layout PDF statement using pdfplumber.
-
-    Returns an empty ParseResult (no transactions, no failures) when the PDF
-    contains no extractable tables — this covers minimal/blank PDFs used in
-    tests and gracefully handles pages without tabular content.
-    """
+    """Parse an SG-layout PDF statement using pdfplumber word-position extraction."""
     transactions: list[Transaction] = []
     failures: list[ParseFailure] = []
-    occurrence_counter: dict[str, int] = {}
-
-    col_map = source.column_map  # may be empty for pdf profile
-    date_col_name = col_map.get("date", "date").lower()
-    desc_col_name = col_map.get("description", "description").lower()
-    debit_col_name = col_map.get("debit", "debit").lower()
-    credit_col_name = col_map.get("credit", "credit").lower()
-
-    global_row_index = 0  # running count across all pages (for failure line numbers)
+    counter: dict[str, int] = {}
+    file_str = str(file_path)
+    global_line = 0
 
     with pdfplumber.open(file_path) as pdf:
         for page in pdf.pages:
-            table = page.extract_table()
-            if not table:
+            words = page.extract_words()
+            if not words:
                 continue
 
-            # First row is assumed to be headers
-            headers = [str(h).strip().lower() if h else "" for h in table[0]]
+            boundary = _find_debit_credit_boundary(words)
+            if boundary is None:
+                continue
 
-            date_idx = _find_col(headers, date_col_name)
-            desc_idx = _find_col(headers, desc_col_name)
-            debit_idx = _find_col(headers, debit_col_name)
-            credit_idx = _find_col(headers, credit_col_name)
+            pending: dict | None = None
 
-            # Fall back to positional indices when no header match found
-            if date_idx is None and desc_idx is None:
-                if len(headers) >= 4:
-                    date_idx, desc_idx, debit_idx, credit_idx = 0, 1, 2, 3
-                else:
-                    continue  # cannot parse this page
-
-            for raw_row in table[1:]:
-                global_row_index += 1
-                line_number = global_row_index
-
-                raw_date = _cell_value(raw_row, date_idx)
-                if not raw_date:
-                    continue  # skip empty rows (common in PDF tables)
-
-                try:
-                    txn_date = parse_date(raw_date, source.locale)
-                except ValueError as exc:
-                    failures.append(
-                        ParseFailure(
-                            file=str(file_path),
-                            line=line_number,
-                            reason=f"Unparseable date {raw_date!r}: {exc}",
-                        )
-                    )
+            for line_words in _group_words_by_line(words):
+                global_line += 1
+                if not line_words:
                     continue
 
-                raw_debit = _cell_value(raw_row, debit_idx)
-                raw_credit = _cell_value(raw_row, credit_idx)
+                first = line_words[0]
 
-                debit: Decimal | None = None
-                credit: Decimal | None = None
+                if _DATE_RE.match(first["text"]):
+                    if pending is not None:
+                        txn = _flush(pending, source, counter, file_str, failures)
+                        if txn is not None:
+                            transactions.append(txn)
 
-                if raw_debit:
-                    try:
-                        debit = abs(parse_amount(raw_debit, source.locale))
-                    except ValueError as exc:
-                        failures.append(
-                            ParseFailure(
-                                file=str(file_path),
-                                line=line_number,
-                                reason=f"Unparseable debit {raw_debit!r}: {exc}",
-                            )
-                        )
-                        continue
+                    amt_idx, _ = _find_amount(line_words)
+                    if amt_idx is not None:
+                        amt_word = line_words[amt_idx]
+                        is_debit = amt_word["x0"] < boundary
+                        amount_str: str | None = amt_word["text"]
+                        desc_words = [
+                            w["text"]
+                            for i, w in enumerate(line_words[2:], start=2)
+                            if i != amt_idx
+                        ]
+                    else:
+                        is_debit = True
+                        amount_str = None
+                        desc_words = [w["text"] for w in line_words[2:]]
 
-                if raw_credit:
-                    try:
-                        credit = abs(parse_amount(raw_credit, source.locale))
-                    except ValueError as exc:
-                        failures.append(
-                            ParseFailure(
-                                file=str(file_path),
-                                line=line_number,
-                                reason=f"Unparseable credit {raw_credit!r}: {exc}",
-                            )
-                        )
-                        continue
+                    pending = {
+                        "date_str": first["text"],
+                        "desc_parts": desc_words,
+                        "amount_str": amount_str,
+                        "is_debit": is_debit,
+                        "line": global_line,
+                    }
 
-                if debit is None and credit is None:
-                    failures.append(
-                        ParseFailure(
-                            file=str(file_path),
-                            line=line_number,
-                            reason="Both debit and credit are missing or empty",
-                        )
-                    )
-                    continue
+                elif pending is not None and _DESC_X_MIN < first["x0"] < _DESC_X_MAX:
+                    pending["desc_parts"].extend(w["text"] for w in line_words)
 
-                description = _cell_value(raw_row, desc_idx)
-                normalized_desc = fingerprint.normalize_description(description)
-                fp_amount: Decimal = debit if debit is not None else credit  # type: ignore[assignment]
-
-                txn_id = fingerprint.transaction_id(
-                    source.account, txn_date, fp_amount, normalized_desc
-                )
-                occ = occurrence_counter.get(txn_id, 0)
-                occurrence_counter[txn_id] = occ + 1
-
-                transactions.append(
-                    Transaction(
-                        date=txn_date,
-                        description=description,
-                        debit=debit,
-                        credit=credit,
-                        account=source.account,
-                        source_file=str(file_path),
-                        txn_id=txn_id,
-                        occurrence=occ,
-                    )
-                )
+            if pending is not None:
+                txn = _flush(pending, source, counter, file_str, failures)
+                if txn is not None:
+                    transactions.append(txn)
 
     return ParseResult(transactions=transactions, failures=failures)

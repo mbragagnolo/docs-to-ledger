@@ -32,6 +32,82 @@ _DATE_PATTERNS: list[tuple[re.Pattern[str], str]] = [
     (re.compile(r"\b(\d{2})-(\d{2})-(\d{4})\b"), "dmy_hyphen"), # dd-mm-yyyy
 ]
 
+# "Montant prélevé le 14 janvier 2026 32,34" — common in French telecom/utility invoices.
+# The `.` after pr and lev handles accented variants (é encodes as a single byte/char).
+_PRELEVEMENT_RE = re.compile(
+    r"pr.lev.\s+(?:sur\s+)?le\s+(\d{1,2})\s+(\S+)\s+(\d{4})\s+"
+    r"((?:\d[\d\s\xa0]*)?(?:\d[\d\.]*),\d{2})",
+    re.IGNORECASE,
+)
+
+# Regex patterns for French month names — uses `.` where accented chars appear so that
+# encoding artifacts (e.g. pdfplumber rendering é as Ø) are still matched.
+_MONTH_PATTERNS: list[tuple[re.Pattern[str], int]] = [
+    (re.compile(r"^janv(?:ier)?\.?$", re.I), 1),
+    (re.compile(r"^f.vr(?:ier)?\.?$", re.I), 2),   # é can be garbled
+    (re.compile(r"^mars$", re.I), 3),
+    (re.compile(r"^avr(?:il)?\.?$", re.I), 4),
+    (re.compile(r"^mai$", re.I), 5),
+    (re.compile(r"^juin$", re.I), 6),
+    (re.compile(r"^juil(?:let)?\.?$", re.I), 7),
+    (re.compile(r"^ao.t$", re.I), 8),               # û can be garbled
+    (re.compile(r"^sept(?:embre)?\.?$", re.I), 9),
+    (re.compile(r"^oct(?:obre)?\.?$", re.I), 10),
+    (re.compile(r"^nov(?:embre)?\.?$", re.I), 11),
+    (re.compile(r"^d.c(?:embre)?\.?$", re.I), 12),  # é can be garbled
+]
+
+
+def _parse_french_month(name: str) -> int | None:
+    """Return 1-12 for a French month name.
+
+    Uses regex with `.` in accent positions so that PDF encoding artifacts
+    (e.g. é rendered as Ø by pdfplumber font-mapping bugs) are still matched.
+    """
+    clean = name.strip()
+    for pattern, num in _MONTH_PATTERNS:
+        if pattern.match(clean):
+            return num
+    return None
+
+
+def _parse_prelevement_amount(raw: str) -> Decimal | None:
+    """Parse a French-format amount string from a 'prélevé le' line."""
+    clean = raw.replace("\xa0", "").replace(" ", "")
+    if "," in clean:
+        # Remove dot thousands separator, convert decimal comma to dot
+        clean = clean.replace(".", "").replace(",", ".")
+    try:
+        return Decimal(clean)
+    except InvalidOperation:
+        return None
+
+
+def _extract_prelevment_features(text: str) -> tuple[datetime.date, Decimal] | None:
+    """Return (debit_date, amount) from the first 'prélevé le DD MMMM YYYY AMOUNT' line.
+
+    Common in French telecom/utility invoices (Bouygues, SFR, EDF, etc.).
+    Takes precedence over generic extraction because it gives the exact bank debit date
+    and amount rather than the invoice issue date and invoice total.
+    """
+    m = _PRELEVEMENT_RE.search(text)
+    if m is None:
+        return None
+    day_str, month_str, year_str, amount_str = (
+        m.group(1), m.group(2), m.group(3), m.group(4)
+    )
+    month_num = _parse_french_month(month_str)
+    if month_num is None:
+        return None
+    try:
+        date = datetime.date(int(year_str), month_num, int(day_str))
+    except ValueError:
+        return None
+    amount = _parse_prelevement_amount(amount_str)
+    if amount is None:
+        return None
+    return date, amount
+
 
 def _extract_amount(text: str) -> Decimal | None:
     """Find the largest Decimal number in *text* using amount patterns."""
@@ -68,19 +144,45 @@ def _extract_date(text: str) -> datetime.date | None:
     return None
 
 
+def _is_barcode_line(line: str) -> bool:
+    """Return True for 2D-DOC markers, barcode data, and uninformative short tokens."""
+    if line == "2D-DOC":
+        return True
+    # Single character or pure-digit lines (page numbers etc.)
+    if len(line) <= 2 or line.isdigit():
+        return True
+    # Long string without spaces (binary/encoded data)
+    if len(line) > 40 and " " not in line:
+        return True
+    tokens = line.split()
+    # Barcode data: many long all-uppercase-letter tokens (e.g. Bouygues 2D-DOC blocks)
+    return len(tokens) >= 4 and all(
+        len(t) > 15 and t.isupper() and t.isalpha() for t in tokens
+    )
+
+
 def _extract_vendor(text: str) -> str | None:
-    """Extract an optional vendor — first non-empty line of text."""
+    """Extract vendor — first non-empty, non-barcode line of text."""
     for line in text.splitlines():
         stripped = line.strip()
-        if stripped:
-            return stripped
+        if not stripped:
+            continue
+        if _is_barcode_line(stripped):
+            continue
+        return stripped
     return None
 
 
 def _features_from_text(source_path: str, text: str, needs_ocr: bool) -> DocumentFeature:
     """Build a DocumentFeature from *text*; fall back to sentinel values when nothing found."""
-    amount = _extract_amount(text)
-    date = _extract_date(text)
+    # Prefer the 'prélevé le' line: gives exact bank debit date and amount.
+    prelevment = _extract_prelevment_features(text)
+    if prelevment is not None:
+        date, amount = prelevment
+    else:
+        amount = _extract_amount(text)
+        date = _extract_date(text)
+
     vendor = _extract_vendor(text) if text.strip() else None
 
     if amount is None or date is None:
